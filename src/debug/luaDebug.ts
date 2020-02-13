@@ -16,7 +16,7 @@ import { basename } from 'path';
 import { LuaDebugRuntime, LuaBreakpoint } from './luaDebugRuntime';
 const { Subject } = require('await-notify');
 import * as Net from 'net';
-import { DataProcessor } from './dataProcessor';
+import { DataProcessor, FileReceiver } from './dataProcessor';
 import { DebugLogger } from '../common/logManager';
 import { StatusBarManager } from '../common/statusBarManager';
 import { LineBreakpoint, ConditionBreakpoint, LogPoint } from './breakpoint';
@@ -144,19 +144,28 @@ export class LuaDebugSession extends LoggingDebugSession {
         Tools.useAutoPathMode = !!args.autoPathMode;
         Tools.pathCaseSensitivity = !!args.pathCaseSensitivity;
 
-        if(Tools.useAutoPathMode === true){
-            Tools.rebuildAcceptExtMap(args.luaFileExtension);
-            Tools.rebuildWorkspaceNamePathMap(args.cwd);
-            Tools.checkSameNameFile();
+        function updatePathMap() {
+            if (Tools.useAutoPathMode === true) {
+                Tools.rebuildAcceptExtMap(args.luaFileExtension);
+                Tools.rebuildWorkspaceNamePathMap(args.cwd);
+                Tools.checkSameNameFile();
+            }
+        }
+
+        if (args.syncFiles) {
+            DataProcessor._fileReciver = new FileReceiver(args.cwd);
+        }
+        else {
+            updatePathMap();
         }
 
         // 普通模式下才需要检查升级，单文件调试不用
-        if( args.name != 'LuaPanda-DebugFile' ){
+        if (args.name != 'LuaPanda-DebugFile') {
             try {
                 UpdateManager.checkIfLuaPandaNeedUpdate();
             } catch (error) {
                 DebugLogger.AdapterInfo("[Error] 检查升级信息失败，可选择后续手动升级。 https://github.com/Tencent/LuaPanda/blob/master/Docs/Manual/update.md ");
-            }      
+            }
         }
 
         // 去除out, Debugger/debugger_lib/plugins/Darwin/   libpdebug_版本号.so
@@ -174,10 +183,11 @@ export class LuaDebugSession extends LoggingDebugSession {
         sendArgs["useCHook"] = args.useCHook;
         sendArgs["adapterVersion"] = String(Tools.adapterVersion);
         sendArgs["autoPathMode"] = Tools.useAutoPathMode;
+        sendArgs["syncFiles"] = args.syncFiles;
 
-        if(args.docPathReplace instanceof Array && args.docPathReplace.length === 2 ){
-            LuaDebugSession.replacePath = new Array( Tools.genUnifiedPath(String(args.docPathReplace[0])), Tools.genUnifiedPath(String(args.docPathReplace[1])));
-        }else{
+        if (args.docPathReplace instanceof Array && args.docPathReplace.length === 2) {
+            LuaDebugSession.replacePath = new Array(Tools.genUnifiedPath(String(args.docPathReplace[0])), Tools.genUnifiedPath(String(args.docPathReplace[1])));
+        } else {
             LuaDebugSession.replacePath = null;
         }
 
@@ -190,6 +200,8 @@ export class LuaDebugSession extends LoggingDebugSession {
         callbackArgs.push(response);
         //4. 启动Adapter的socket   |   VSCode = Server ; Debugger = Client
         LuaDebugSession._server = Net.createServer(socket => {
+            //同步文件
+            DataProcessor._syncFiles = !!DataProcessor._fileReciver;
             //--connect--
             DebugLogger.AdapterInfo("Debugger  " + socket.remoteAddress + ":" + socket.remotePort + "  connect!");
             DataProcessor._socket = socket;
@@ -197,17 +209,17 @@ export class LuaDebugSession extends LoggingDebugSession {
             this._runtime.start((arr, info) => {
                 DebugLogger.AdapterInfo("已建立连接，发送初始化协议和断点信息!");
                 //对luapanda.lua的版本控制，低于一定版本要提示升级
-                if (typeof info.debuggerVer == "string"){
+                if (typeof info.debuggerVer == "string") {
                     //转数字
                     let DVerArr = info.debuggerVer.split(".");
                     let AVerArr = String(Tools.adapterVersion).split(".");
-                    if (DVerArr.length === AVerArr.length && DVerArr.length === 3 ){
+                    if (DVerArr.length === AVerArr.length && DVerArr.length === 3) {
                         //在adapter和debugger版本号长度相等的前提下，比较大版本，大版本 <2 或者 小版本 < 1 就提示. 2.1.0以下会提示
-                        let intDVer = parseInt(DVerArr[0]) * 10000  + parseInt(DVerArr[1]) * 100 + parseInt(DVerArr[2]);
-                        if ( intDVer < 20100 ){
+                        let intDVer = parseInt(DVerArr[0]) * 10000 + parseInt(DVerArr[1]) * 100 + parseInt(DVerArr[2]);
+                        if (intDVer < 20100) {
                             DebugLogger.showTips("当前调试器的lua文件版本过低，可能无法正常使用，请升级到最新版本。帮助文档 https://github.com/Tencent/LuaPanda/blob/master/Docs/Manual/update.md ", 2);
                         }
-                    }else{
+                    } else {
                         DebugLogger.showTips("调试器版本号异常:" + info.debuggerVer + ". 建议升级至最新版本。帮助文档 https://github.com/Tencent/LuaPanda/blob/master/Docs/Manual/update.md ", 1);
                     }
                 }
@@ -253,8 +265,18 @@ export class LuaDebugSession extends LoggingDebugSession {
             });
 
             socket.on('data', (data) => {
-                DebugLogger.AdapterInfo('[Get Msg]:' + data);
-                DataProcessor.processMsg(data.toString());
+                if (DataProcessor._syncFiles) {
+                    let finished = DataProcessor._fileReciver.processPackage(data);
+                    if (finished) {
+                        DataProcessor._syncFiles = false;
+                        data = DataProcessor._fileReciver.getLeftData();
+                        updatePathMap();
+                    }
+                }
+                if (!DataProcessor._syncFiles) {
+                    DebugLogger.AdapterInfo('[Get Msg]:' + data);
+                    DataProcessor.processMsg(data.toString());
+                }
             });
         }).listen(LuaDebugSession.TCPPort, function () {
             DebugLogger.AdapterInfo("listening...");
@@ -264,28 +286,28 @@ export class LuaDebugSession extends LoggingDebugSession {
         LuaDebugSession.isListening = true;
         LuaDebugSession.breakpointsArray = new Array();
         this.sendEvent(new InitializedEvent()); //收到返回后，执行setbreakpoint
-        
+
         //单文件调试模式
-        if(args.name === 'LuaPanda-DebugFile'){       
+        if (args.name === 'LuaPanda-DebugFile') {
             // 获取活跃窗口
             let retObject = Tools.getVSCodeAvtiveFilePath();
-            if( retObject["retCode"] !== 0 ){
+            if (retObject["retCode"] !== 0) {
                 DebugLogger.DebuggerInfo(retObject["retMsg"]);
                 return;
             }
             let filePath = retObject["filePath"];
 
-            if(LuaDebugSession._debugFileTermianl){
+            if (LuaDebugSession._debugFileTermianl) {
                 LuaDebugSession._debugFileTermianl.dispose();
             }
             LuaDebugSession._debugFileTermianl = vscode.window.createTerminal({
                 name: "Debug Lua File (LuaPanda)",
-                env: {}, 
+                env: {},
             });
 
             // 把路径加入package.path
             let pathCMD = "'";
-            let pathArr = Tools.VSCodeExtensionPath.split( path.sep );
+            let pathArr = Tools.VSCodeExtensionPath.split(path.sep);
             let stdPath = pathArr.join('/');
             pathCMD = pathCMD + stdPath + "/Debugger/?.lua;"
             pathCMD = pathCMD + args.packagePath.join(';')
@@ -297,37 +319,37 @@ export class LuaDebugSession extends LoggingDebugSession {
             let runCMD = pathCMD + reqCMD + doFileCMD;
 
             let LuaCMD;
-            if(args.luaPath && args.luaPath !== ''){
+            if (args.luaPath && args.luaPath !== '') {
                 LuaCMD = args.luaPath + " -e "
-            }else{
+            } else {
                 LuaCMD = "lua -e ";
             }
-            LuaDebugSession._debugFileTermianl.sendText( LuaCMD + runCMD , true);
+            LuaDebugSession._debugFileTermianl.sendText(LuaCMD + runCMD, true);
             LuaDebugSession._debugFileTermianl.show();
         }
-        else{
+        else {
             // 非单文件调试模式下，拉起program
-            if(args.program != undefined && args.program.trim() != ''){
+            if (args.program != undefined && args.program.trim() != '') {
                 let fs = require('fs');
-                if(fs.existsSync(args.program) && fs.statSync(args.program).isFile()){
+                if (fs.existsSync(args.program) && fs.statSync(args.program).isFile()) {
                     //program 和 args 分开
-                    if(LuaDebugSession._programTermianl){
+                    if (LuaDebugSession._programTermianl) {
                         LuaDebugSession._programTermianl.dispose();
                     }
                     LuaDebugSession._programTermianl = vscode.window.createTerminal({
                         name: "Run Program File (LuaPanda)",
-                        env: {}, 
+                        env: {},
                     });
-    
+
                     let progaamCmdwithArgs = args.program;
                     for (const arg of args.args) {
                         progaamCmdwithArgs = progaamCmdwithArgs + " " + arg;
                     }
-                    
-                    LuaDebugSession._programTermianl.sendText(progaamCmdwithArgs , true);
-                    LuaDebugSession._programTermianl.show(); 
-                }else{
-                    vscode.window.showErrorMessage("launch.json 文件中 program 设置的路径错误： 文件 " + args.program + " 不存在，请修改后再试。" , "好的");
+
+                    LuaDebugSession._programTermianl.sendText(progaamCmdwithArgs, true);
+                    LuaDebugSession._programTermianl.show();
+                } else {
+                    vscode.window.showErrorMessage("launch.json 文件中 program 设置的路径错误： 文件 " + args.program + " 不存在，请修改后再试。", "好的");
                 }
             }
         }
@@ -341,9 +363,9 @@ export class LuaDebugSession extends LoggingDebugSession {
         let path = <string>args.source.path;
         path = Tools.genUnifiedPath(path);
 
-        if(LuaDebugSession.replacePath && LuaDebugSession.replacePath.length === 2){
+        if (LuaDebugSession.replacePath && LuaDebugSession.replacePath.length === 2) {
             path = path.replace(LuaDebugSession.replacePath[1], LuaDebugSession.replacePath[0]);
-        }        
+        }
 
         let vscodeBreakpoints = new Array(); //VScode UI识别的断点（起始行号1）
 
@@ -381,7 +403,7 @@ export class LuaDebugSession extends LoggingDebugSession {
             }
         }
 
-        if(!isbkPathExist){
+        if (!isbkPathExist) {
             let bk = new Object();
             bk["bkPath"] = path;
             bk["bksArray"] = vscodeBreakpoints;
@@ -414,12 +436,12 @@ export class LuaDebugSession extends LoggingDebugSession {
         const stk = this._runtime.stack(startFrame, endFrame);
         response.body = {
             stackFrames: stk.frames.map(f => {
-                    let source = f.file;
-                    if(LuaDebugSession.replacePath && LuaDebugSession.replacePath.length === 2){
-                        source = source.replace(LuaDebugSession.replacePath[0], LuaDebugSession.replacePath[1]);
-                    }
-                    return new StackFrame(f.index, f.name, this.createSource(source), f.line);
+                let source = f.file;
+                if (LuaDebugSession.replacePath && LuaDebugSession.replacePath.length === 2) {
+                    source = source.replace(LuaDebugSession.replacePath[0], LuaDebugSession.replacePath[1]);
                 }
+                return new StackFrame(f.index, f.name, this.createSource(source), f.line);
+            }
             ),
             totalFrames: stk.count
         };
@@ -510,39 +532,39 @@ export class LuaDebugSession extends LoggingDebugSession {
     /**
      * 设置变量的值
      */
-    protected setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments){
+    protected setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments) {
         let callbackArgs = new Array();
         callbackArgs.push(this);
-        callbackArgs.push(response);   
-    
+        callbackArgs.push(response);
+
         let referenceString = this._variableHandles.get(args.variablesReference);
-        let referenceArray : string[] = [];
-        if(referenceString != null)  {
+        let referenceArray: string[] = [];
+        if (referenceString != null) {
             referenceArray = referenceString.split('_');
             if (referenceArray.length < 2) {
-                DebugLogger.AdapterInfo("[variablesRequest Error] #referenceArray < 2 , #referenceArray = "+ referenceArray.length);
+                DebugLogger.AdapterInfo("[variablesRequest Error] #referenceArray < 2 , #referenceArray = " + referenceArray.length);
                 this.sendResponse(response);
                 return;
             }
-        }else{
+        } else {
             //_variableHandles 取不到的情况下 referenceString 即为真正的变量 ref
             referenceArray[0] = String(args.variablesReference);
         }
 
         this._runtime.setVariable((arr, info) => {
-            if(info.success === "true"){
+            if (info.success === "true") {
                 arr[1].body = {
                     value: String(info.value),
                     type: String(info.type),
                     variablesReference: parseInt(info.variablesReference)
                 };
-                DebugLogger.showTips( info.tip );
-            }else{
-                DebugLogger.showTips("变量赋值失败 [" + info.tip + "]" );
+                DebugLogger.showTips(info.tip);
+            } else {
+                DebugLogger.showTips("变量赋值失败 [" + info.tip + "]");
             }
             let ins = arr[0];
-            ins.sendResponse(arr[1]);   
-        }, callbackArgs,  args.name,  args.value, parseInt(referenceArray[0]) , parseInt(referenceArray[1]));
+            ins.sendResponse(arr[1]);
+        }, callbackArgs, args.name, args.value, parseInt(referenceArray[0]), parseInt(referenceArray[1]));
     }
 
     /**
@@ -554,21 +576,21 @@ export class LuaDebugSession extends LoggingDebugSession {
         callbackArgs.push(response);
 
         let referenceString = this._variableHandles.get(args.variablesReference);
-        let referenceArray : string[] = [];
-        if(referenceString != null)  {
+        let referenceArray: string[] = [];
+        if (referenceString != null) {
             referenceArray = referenceString.split('_');
             if (referenceArray.length < 2) {
-                DebugLogger.AdapterInfo("[variablesRequest Error] #referenceArray < 2 , #referenceArray = "+ referenceArray.length);
+                DebugLogger.AdapterInfo("[variablesRequest Error] #referenceArray < 2 , #referenceArray = " + referenceArray.length);
                 this.sendResponse(response);
                 return;
             }
-        }else{
+        } else {
             //_variableHandles 取不到的情况下 referenceString 即为真正的变量ref
             referenceArray[0] = String(args.variablesReference);
         }
 
         this._runtime.getVariable((arr, info) => {
-            if( info == undefined ){
+            if (info == undefined) {
                 info = new Array();
             }
             const variables = new Array<DebugProtocol.Variable>();
@@ -585,7 +607,7 @@ export class LuaDebugSession extends LoggingDebugSession {
             };
             let ins = arr[0];
             ins.sendResponse(arr[1]);
-        }, callbackArgs, parseInt(referenceArray[0]) , parseInt(referenceArray[1]));
+        }, callbackArgs, parseInt(referenceArray[0]), parseInt(referenceArray[1]));
     }
 
     /**

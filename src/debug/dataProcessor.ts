@@ -1,11 +1,102 @@
+import * as path from "path";
+import * as fs from "fs";
 import { LuaDebugRuntime } from './luaDebugRuntime';
 import { Socket } from 'net';
 import { DebugLogger } from '../common/logManager';
 import { LuaDebugSession } from './luaDebug';
 
+function deleteFolder(folder:string) {
+	if(fs.existsSync(folder)) {
+		fs.readdirSync(folder).forEach(function(file, index) {
+			let curPath = folder + "/" + file;
+			if(fs.statSync(curPath).isDirectory()) { deleteFolder(curPath); }
+			else {fs.unlinkSync(curPath)};
+		});
+		fs.rmdirSync(folder);
+	}
+}
+
+export class FileReceiver {
+    private total: number = 0;
+    private totalData: Buffer = Buffer.alloc(0);
+    private emptyData: Buffer = Buffer.alloc(0);
+    private outDir: string = "";
+
+    constructor(cwd: string) {
+        this.outDir = path.join(cwd, "temp");
+        deleteFolder(this.outDir);
+    }
+
+    private getBufferSize(data: Buffer, byteSize: number) {
+        let size = 0;
+        for (let i = 0; i < byteSize; i++) {
+            // tslint:disable-next-line:no-bitwise
+            size += (data[i] << ((byteSize - i - 1) * 8))
+        }
+        return size;
+    }
+
+    private getBuffer(data: Buffer, byteSize: number, byteOffset: number = 0) {
+        return data.slice(byteSize + byteOffset, byteSize + byteOffset + this.getBufferSize(data, byteSize));
+    }
+
+    private unpackPackage(data: Buffer) {
+        let fileName = this.getBuffer(data, 2).toString();
+        if (fileName === "__sendFileEnd") {
+            return true;
+        }
+        let context = this.getBuffer(data, 4, 2 + fileName.length).toString();
+        let filePath = path.join(this.outDir, fileName);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, context);
+        DebugLogger.AdapterInfo("downLoad: " + fileName);
+        return false;
+    }
+
+    private recvPackage(data: Buffer) {
+        if (data.length < 4) {
+            return null;
+        }
+        if (this.total === 0) {
+            this.total = this.getBufferSize(data, 4);
+        }
+        if (data.length < 4 + this.total) {
+            this.totalData = data;
+            return null;
+        }
+        this.totalData = data.slice(4 + this.total);
+        data = data.slice(4, 4 + this.total);
+        this.total = 0;
+        return data;
+    }
+
+    public getLeftData() {
+        return this.total === 0 ? this.totalData : this.emptyData;
+    }
+
+    public processPackage(data: Buffer, concat: boolean = true) {
+        let finished = false;
+        let result = this.recvPackage(concat ? Buffer.concat([this.totalData, data]): data);
+        if (result) {
+            if (this.unpackPackage(result)) {
+                finished = true;
+            }
+            if (this.processPackage(this.totalData, false)) {
+                finished = true;
+            }
+        }
+        if (finished) {
+            this.total = 0;
+        }
+        return finished;
+    }
+}
+
 //网络收发消息，记录回调
 export class DataProcessor {
 
+    public static _syncFiles: boolean = false;
+    public static _fileReciver: FileReceiver;
     public static _runtime: LuaDebugRuntime;							//RunTime句柄
     public static _socket: Socket;
     private static orderList: Array<Object> = new Array();			//记录随机数和它对应的回调

@@ -781,6 +781,24 @@ function this.reConnect()
     return 0;
 end
 
+function this.sendFile(file, dir)
+    io.input(file)
+    local _, b = file:find(dir)
+    local fileName = b and file:sub(b + 2) or file
+    local ctx = string.pack(">s2", fileName) .. string.pack(">s4", io.read("*a"))
+    local data = string.pack(">s4", ctx)
+    -- print("send:", file, (data:byte(1, 1) << 32) + (data:byte(2, 2) << 16) + (data:byte(3, 3) << 8) + data:byte(4, 4))
+    while data ~= "" do
+        sock:send(data:sub(0, 65536))
+        data = data:sub(65537)
+    end
+    io.close()
+end
+
+function this.sendFileEnd()
+    sock:send(string.pack(">s4", string.pack(">s2", "__sendFileEnd")))
+end
+
 -- 向adapter发消息
 -- @sendTab 消息体table
 function this.sendMsg( sendTab )
@@ -1000,6 +1018,17 @@ function this.dataProcess( dataStr )
         end
     elseif dataTable.cmd == "initSuccess" then
         --初始化会传过来一些变量，这里记录这些变量
+        if dataTable.info.syncFiles == "true" then
+            if LuaPanda.getSrcFiles then
+                local files, dir = LuaPanda.getSrcFiles()
+                if files then
+                    for _, v in ipairs(files) do
+                        this.sendFile(v, dir)
+                    end
+                end
+            end
+            this.sendFileEnd()
+        end
         --Base64
         if dataTable.info.isNeedB64EncodeStr == "true" then
             isNeedB64EncodeStr = true;

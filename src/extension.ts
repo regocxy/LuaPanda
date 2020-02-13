@@ -307,7 +307,7 @@ class LuaConfigurationProvider implements vscode.DebugConfigurationProvider {
             }).listen(0);
         }
         // make VS Code connect to debug server instead of launching debug adapter
-        config.debugServer = this._server.address().port;
+        config.debugServer = (this._server.address() as Net.AddressInfo).port;
         return config;
     }
 
