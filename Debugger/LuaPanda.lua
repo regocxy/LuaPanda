@@ -781,18 +781,16 @@ function this.reConnect()
     return 0;
 end
 
-function this.sendFile(file, dir)
-    io.input(file)
+function this.sendFile(file, fileData, dir)
     local _, b = file:find(dir)
     local fileName = b and file:sub(b + 2) or file
-    local ctx = string.pack(">s2", fileName) .. string.pack(">s4", io.read("*a"))
+    local ctx = string.pack(">s2", fileName) .. string.pack(">s4", fileData)
     local data = string.pack(">s4", ctx)
     -- print("send:", file, (data:byte(1, 1) << 32) + (data:byte(2, 2) << 16) + (data:byte(3, 3) << 8) + data:byte(4, 4))
     while data ~= "" do
         sock:send(data:sub(0, 65536))
         data = data:sub(65537)
     end
-    io.close()
 end
 
 function this.sendFileEnd()
@@ -1022,8 +1020,8 @@ function this.dataProcess( dataStr )
             if LuaPanda.getSrcFiles then
                 local files, dir = LuaPanda.getSrcFiles()
                 if files then
-                    for _, v in ipairs(files) do
-                        this.sendFile(v, dir)
+                    for v in ipairs(files) do
+                        this.sendFile(v.name, v.data, dir)
                     end
                 end
             end
